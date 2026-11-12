@@ -4,11 +4,9 @@
 
 首版面向主动管理基金经理，读取机构 OMS（订单管理系统）导出的持仓、成交和资产文件，在本机生成 Excel 复盘表。个人投资者是后续目标用户，当前输入格式以机构 OMS 为准。
 
-Portfolio Debrief（组合复盘）原名 Trading Decision Ledger。GitHub 仓库为 [portfolio-debrief](https://github.com/CyberYY2030/portfolio-debrief)。
-
 ## Windows 使用方法
 
-打开便携包内的「生成持仓表.cmd」，选择三份 OMS 导出所在目录，即可为每个产品生成一份 Excel。首次可用包内的虚构账户试读。详见 [Windows 使用说明](windows/README.md)。
+[下载 Windows x64 便携包（A3 试用版）](https://github.com/CyberYY2030/portfolio-debrief/releases/download/A3/portfolio-debrief-A3-windows-x64.zip)，完整解压后双击「生成持仓表.cmd」，选择三份 OMS 导出所在目录，即可为每个产品生成一份 Excel。首次可用包内的虚构账户试读。详见 [Windows 使用说明](windows/README.md)。
 
 ## 从源码构建便携包
 
