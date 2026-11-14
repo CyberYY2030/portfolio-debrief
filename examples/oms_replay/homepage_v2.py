@@ -11,6 +11,7 @@ from decimal import Decimal as D
 from pathlib import Path
 
 import daily
+import fetch_bars
 import oms_daily as od
 import render
 import replay
@@ -299,7 +300,7 @@ def pnl_text(data):
     prefix=(f"持仓合计贡献 {fmt(value,' 个百分点',signed=True)}；与净值涨跌差额 {fmt(difference,' 个百分点',signed=True)}；" if difference is not None and abs(difference)>D('.05') else '')
     if value is None:
         return prefix+'缺前一估值日持仓，个股当日盈亏未知'
-    if not all(data['verified'].values()):
+    if not all(data['verified'].values()) or any(w is None for w in f['weights'].values()):
         return prefix+'个股涨跌分布待核实'
     contributions=f['contribution_pct']
     if abs(value)<D('.30') and not any(abs(v)>=D('.30') for v in contributions.values()):
@@ -368,14 +369,14 @@ def index_return(index, start, end):
 
 # Trial wording thresholds. Risk lines and episode transitions remain in RULES.
 CONCLUSION_HIGH = D(80)
-CONCLUSION_VERY_HIGH = D(90)
+CONCLUSION_WEIGHT_CHANGE = D(3)
+CONCLUSION_LOSS_WEIGHT = D(20)
 CONCLUSION_FLOW = D(2)
 CONCLUSION_STREAK = 3
 CONCLUSION_MANY = 3
-CONCLUSION_HALF = D('.5')
 NEAR_LINE_PP = D(1)
 TRADE_DEVIATION_PCT = D(3)
-FOCUS_REASONS = ('今日升级','今日成交','临近下一条线','拖累最大','首日已在线外','持续提醒')
+FOCUS_REASONS = ('今日升级','今日成交','临近下一条警示线','拖累最大','首日已在警示线外','持续提醒')
 
 
 def previous_alert(result, day, symbol):
@@ -425,6 +426,53 @@ def operation_facts(result, start, symbol=None):
     return out
 
 
+# B1 thresholds are percentages; comparisons use unrounded Decimal values.
+TRADE_METHOD = '日线粗估'
+TRADE_MAIN_PCT = D(5)
+TRADE_WIDE_PCT = D(7)
+TRADE_LIMIT_TOLERANCE_PP = D('0.5')
+
+
+def trade_band(symbol):
+    market, _, code = symbol.partition('|')
+    if market.startswith('港股通'):return TRADE_WIDE_PCT, None
+    if market in ('北京', '北交所'):return TRADE_WIDE_PCT, D(30)
+    if market == '深圳' and code.startswith('30'):return TRADE_WIDE_PCT, D(20)
+    if market == '上海' and code.startswith('68'):return TRADE_WIDE_PCT, D(20)
+    if market in ('上海','深圳'):return TRADE_MAIN_PCT, D(10)
+    return None, None
+
+
+def trade_direction(side, relative):
+    return relative > 0 if side == '买入' else relative < 0
+
+
+def classify_trade(t, close, previous_close, daily_change, fills=()):
+    """An execution description, never an inference about a trader's habit."""
+    # Keep raw fills intact for a future timestamp-based method. Only daily bars exist now.
+    od.require(TRADE_METHOD == '日线粗估', '未知的追涨杀跌判定方法')
+    t['method'] = TRADE_METHOD
+    threshold, limit = trade_band(t['symbol'])
+    t.update(behavior='', relative=None, skip_reason='')
+    if not t['verified']:return
+    if t.get('ex_rights'):
+        t['skip_reason']='除权除息日昨收不可比';return
+    if close is None or previous_close is None:
+        if t['closed'] and t['side']=='卖出':t['skip_reason']='收盘价未取到'
+        return
+    if threshold is None:return
+    if limit is not None and abs(daily_change)>limit+TRADE_LIMIT_TOLERANCE_PP:
+        t['skip_reason']='当日涨跌超出涨跌幅限制';return
+    relative=(t['average']/previous_close-1)*100
+    t['relative']=relative
+    sign=1 if t['side']=='买入' else -1
+    adverse=t['deviation']*sign>=TRADE_DEVIATION_PCT
+    first=relative*sign>=threshold
+    second=trade_direction(t['side'],relative) and adverse
+    if first or second:t['behavior']='追涨' if sign==1 else '杀跌'
+    elif adverse:t['behavior']='买入后续跌' if sign==1 else '卖出后续涨'
+
+
 def trade_facts(result):
     day=result['as_of'];data=result['days'][day];out=[]
     for s,ts in sorted((data['trades'] or {}).items()):
@@ -436,17 +484,36 @@ def trade_facts(result):
         change=after-before if before is not None and after is not None else None
         okay=data['verified'].get(s,False) and all(not t['成交金额'] or t['成交金额(RMB)']>0 for t in ts)
         state_list=list((previous or {}).get('states',{}).get(s,{}).values())
+        close=previous_close=daily_change=None
+        ex_rights=False
+        if current:
+            value=current['最新价'];pct=current.get('当日涨跌幅（%）')
+            if value is not None and value.is_finite() and value>0:close=value
+            if close is not None and pct is not None and pct.is_finite() and pct>D(-100):
+                previous_close=close/(1+pct/100);daily_change=pct
+        else:
+            pair=result.get('bars',{}).get(s,[])
+            if len(pair)==2 and pair[0]['date']<pair[1]['date']==day:
+                a,b=(D(row['close']) for row in pair)
+                if a.is_finite() and b.is_finite() and a>0 and b>0:
+                    previous_close,close=a,b;daily_change=(b/a-1)*100
+                    ex_rights=pair[-1].get('ex_rights',False)
         for side in ('买入','卖出'):
             fills=[t for t in ts if t['委托方向']==side and t['成交数量']>0]
             if not fills:continue
             amount=sum((t['成交金额'] for t in fills),ZERO);qty=sum((t['成交数量'] for t in fills),ZERO)
-            deviation=(amount/qty/current['最新价']-1)*100 if current and current['最新价']>0 else None
-            out.append(dict(symbol=s,name=ts[0]['证券名称'],side=side,closed=current is None and okay,
+            amount_rmb=sum((t['成交金额(RMB)'] for t in fills),ZERO)
+            average=amount/qty
+            deviation=(average/close-1)*100 if close is not None else None
+            t=dict(symbol=s,name=ts[0]['证券名称'],side=side,closed=current is None and okay,
                 verified=okay,alerted=alerted,previous=previous['date'] if previous else None,
                 previous_states=state_list,before=before,after=after,change=change,
                 loss=data['facts']['loss_rates'].get(s) if current else prior.get('loss_rates',{}).get(s),
-                pp=od.pct(sum((t['成交金额(RMB)'] for t in fills),ZERO),od.denominator_assets(data['account']))*(1 if side=='买入' else -1),
-                deviation=deviation if okay else None))
+                pp=od.pct(amount_rmb,od.denominator_assets(data['account']))*(1 if side=='买入' else -1),
+                average=average,amount_rmb=amount_rmb,deviation=deviation if okay else None,ex_rights=ex_rights)
+            classify_trade(t,close,previous_close,daily_change,fills)
+            out.append(t)
+    # Retain this ordering: page_facts also consumes it for other page sections.
     return sorted(out,key=lambda t:(t['change'] is None,-abs(t['change'] or ZERO),t['symbol'],t['side']))
 
 
@@ -458,97 +525,90 @@ def upgrade_key(item):
 
 
 def conclusion(f):
-    """Pure rendering of already computed facts; no ledger, I/O or model."""
-    od.require(f and 'fund' in f,'missing conclusion facts')
-    fund=f['fund'];status=fund['status'];line=f['fund_line'];streak=f['streak']
-    continuous=streak is not None and streak>=CONCLUSION_STREAK
-    if status=='无法判定':nav='净值回撤待核实'
-    elif status in UPGRADES:nav=(f'净值连续回撤，今日升至超 {line}%' if continuous else f'净值回撤升至超 {line}%')
-    elif status.startswith('观察'):nav=f"净值回到 {f.get('fund_first_line',D(5))}% 线内第 {fund['inside']} 日，提醒未解除"
-    elif status=='解除':nav='净值回撤提醒解除'
-    elif status=='已在档内':nav=f'净值回撤超 {line}%'
-    elif fund['active']:
-        nav=f'净值连续回撤，已超 {line}%' if continuous else f'净值今日反弹，回撤仍超 {line}%' if f['daily_return'] is not None and f['daily_return']>0 else f'净值回撤仍超 {line}%'
-    else:nav=('净值连续下跌，' if continuous else '净值')+f"回撤未超 {f.get('fund_first_line',D(5))}%"
-    losses=f['losses'];ups=f['upgrades'];budget=2;used=set()
-    def take(group):
-        nonlocal budget
-        chosen=[]
-        for i in group:
-            if i['symbol'] not in used and budget:
-                chosen.append(i);used.add(i['symbol']);budget-=1
-        return chosen
-    def event(i):
-        verb={'首次':'首次超','升档':'升至超','再次':'再次超'}[i['status']]
-        label={'loss':'浮亏','fall':'近 5 日跌幅','guard':'盈利保护回撤'}[i['rule']]
-        return label+verb+f" {i['line']}%"
-    change=''
-    if not f['first']:
-        if len(ups)>=CONCLUSION_MANY:
-            i=take(ups[:1])[0];change=f"今日多只升级，最重的是{i['name']}（{event(i)}）"
-        elif ups:change='今日'+'、'.join(i['name']+' '+event(i) for i in take(ups))
+    """Render one concise summary from measured facts, without I/O."""
+    od.require(f and 'fund' in f, 'missing conclusion facts')
+    fund=f['fund'];status=fund['status'];active=fund['active'];day=f['today']
+    line=f['fund_line'];first_line=f['fund_first_line'];metric=fund['metric']
+    continuous=f['streak'] is not None and f['streak']>=CONCLUSION_STREAK
+    if metric is None:drawdown='回撤待核实'
+    elif f['peak']==day:drawdown='净值今日创高点'
+    else:drawdown=f"距高点（{f['peak']}）回撤 "+fmt(metric)
+    if continuous and metric is not None:drawdown=f"净值连跌 {f['streak']} 日，"+drawdown
+    if status=='首次':state=f'今日首次跌破 {line}% 警示线'
+    elif status in ('升档','再次'):state=f"今日{'再次' if status=='再次' else ''}跌破 {line}% 警示线，提醒第 {fund['days']} 日"
+    elif status=='已在档内':state=f'账本首日已超 {line}% 警示线'
+    elif status.startswith('观察'):state=f"回到 {first_line}% 警示线内第 {fund['inside']} 日，提醒未解除"
+    elif status=='解除':state='回撤提醒今日解除'
+    elif status=='无法判定':state='回撤待核实'+(f"，提醒第 {fund['days']} 日" if active else '')
+    elif active:
+        state=f"已超 {line}% 警示线，提醒第 {fund['days']} 日"
+        if fund['tier']<fund['highest']:state+=f"（本段最深超 {f['fund_lines'][fund['highest']-1]}%）"
+    else:state=f'未到 {first_line}% 警示线'
+    distance=next_distance(fund,f['fund_lines'])
+    if metric is not None and active and not status.startswith('观察') and distance is not None and distance<=NEAR_LINE_PP:
+        next_line=f['fund_lines'][fund['tier']]
+        state+='，临近 '+str(next_line)+'% 警示线，差 '+fmt(distance,' 个百分点')
+    elif not active and status!='解除' and metric is not None and ZERO<=first_line-metric<=NEAR_LINE_PP:
+        state=f'临近 {first_line}% 警示线，差 '+fmt(first_line-metric,' 个百分点')
+    account=drawdown
+    # Unknown drawdown and state express the same fact only once.
+    if not (f['peak']==day and state==f'未到 {first_line}% 警示线'):
+        account+=('，'+state if metric is not None else (f"，提醒第 {fund['days']} 日" if active else ''))
+    if active and f['base']!=f['peak']:account+=f"；本段高点 {f['base']} 以来净值 "+fmt(f['nav_return'],signed=True,baseline=f['base']==day)
+    if active and f['base_outside_window']:account+='；本段高点已移出 60 日窗口，累计基准不变'
+    parts=[account]
+    if f['has_index']:
+        if active and f['base']!=day:
+            label=('本段高点' if f['base']!=f['peak'] else '高点')+'以来'
+            account_return,index_return=f['nav_return'],f['index_base']
+        elif f['nav_count']>=6:
+            label='近 5 日';account_return,index_return=f['five'],f['index_five']
+        else:label=''
+        if label:
+            if account_return is None or index_return is None:market=label+'与沪深300 的对比未知'
+            else:
+                delta=account_return-index_return
+                market=label+('与沪深300 持平' if delta.quantize(D('.01'))==0 else '比沪深300 '+('高' if delta>0 else '低')+' '+fmt(abs(delta),' 个百分点'))
+            parts.append(market)
+    weight=f['weight']
+    losses=f['losses'];total_weight=sum((i['weight'] for i in losses),ZERO) if all(i['weight'] is not None for i in losses) else None
+    broad=bool(losses) and total_weight is not None and total_weight>=CONCLUSION_LOSS_WEIGHT
+    loss_line=f['loss_first_line']
+    if f['total']==0:loss='无股票持仓'
+    elif not losses:loss=''
+    else:loss=f'浮亏超 {loss_line}% 的持仓 {len(losses)} 只，'+('合计' if len(losses)>1 else '')+'占资产 '+(fmt(total_weight) if total_weight is not None else '待核实')
+    if loss:parts.append(('浮亏面大：' if broad else '')+loss)
+    if f['total']:
+        ups=f['upgrades']
+        if f['first']:change='账本首日，无法判断今日变化'
+        elif ups:change=f"今日 {len(ups)} 只升级"
         else:change='今日无升级'
-    state=''
-    if len(losses)>=CONCLUSION_MANY:
-        state=('过半持仓' if f['total'] and D(len(losses))/f['total']>=CONCLUSION_HALF else '多只持仓')+f"浮亏超 {f.get('loss_first_line',D(10))}%"
-        deepest=max(i['line'] for i in losses)
-        if deepest>f.get('loss_first_line',D(10)):state+=f'（最深超 {deepest}%）'
-    elif losses:
-        remaining=[i for i in losses if i['symbol'] not in used];chosen=take(remaining)
-        lines=defaultdict(list)
-        for i in chosen:lines[i['line']].append(i['name'])
-        state='、'.join('、'.join(lines[line])+f' 浮亏超 {line}%' for line in sorted(lines,reverse=True))
-        unspoken=[i for i in remaining if i not in chosen]
-        if unspoken:state+=('，' if state else '')+f"另有持仓浮亏超 {max(i['line'] for i in unspoken)}%"
-    elif not ups:state=f"无持仓浮亏超 {f.get('loss_first_line',D(10))}%"
-    if f['total']==0:state='无股票持仓'
-    parts=[x for x in (state,change) if x]
-    if not f['first'] and not ups:
-        for group,word in ((f['near'],'临近下一条线'),(f['cleared'],'提醒解除')):
-            if not group:continue
-            if len(group)>=CONCLUSION_MANY:parts.append('多只'+word)
+        if not f['first']:
+            if f['near']:change+=f"，{len(f['near'])} 只临近下一条警示线"
+            if f['cleared']:change+=f"，{len(f['cleared'])} 只提醒解除"
+            if f['holding_unknown']:change+='，部分持仓状态待核实'
+        parts.append(change)
+    high=weight is not None and weight>=CONCLUSION_HIGH and (not active or f['net'] is None or f['net']>-CONCLUSION_FLOW)
+    warn=sum((active and not status.startswith('观察'),broad,high))>=2
+    trades=f['trades']
+    def flow(value):
+        if value.quantize(D('.01'))==0:return '买卖相抵'
+        return ('净买入 ' if value>0 else '净卖出 ')+fmt(abs(value),' 个百分点')
+    if not trades:operation='今日无成交'
+    elif any(not t['verified'] or t['pp'] is None for t in trades):operation='今日有成交待核实，净买入和换手未计'
+    else:
+        operation='今日'+flow(sum((t['pp'] for t in trades),ZERO))+'，换手 '+fmt(sum((abs(t['pp']) for t in trades),ZERO))
+    if active:
+        if f['first'] and status=='已在档内':operation+='，此前的操作未知'
+        elif fund['start']!=day:
+            if f['operation_status']=='missing':operation+='，首次提醒以来的操作未知'
+            elif f['operation_status']=='unverified' or f['net'] is None:operation+='，首次提醒以来的操作待核实'
             else:
-                already=[i for i in group if i['symbol'] in used]
-                remaining=[i for i in group if i['symbol'] not in used]
-                chosen=take(remaining)
-                if already:parts.append(('该持仓' if len(already)==1 else '上述持仓')+word)
-                if chosen:parts.append('、'.join(i['name'] for i in chosen)+' '+word)
-                if any(i not in chosen for i in remaining):parts.append('另有持仓'+word)
-    if f.get('holding_unknown'):parts.append('部分持仓状态待核实')
-    holding='无股票持仓' if f['total']==0 else ('账本首日，' if f['first'] else '')+'，'.join(parts)
-    operations=[];budget=2;used=set()
-    active=fund['active'];flow=f['net'];op_status=f['operation_status']
-    if active or f['buys'] or f['sells'] or f['closes'] or f['trade_unknown']:
-        weight=f['weight']
-        if weight is None:operations.append('仓位待核实')
-        elif weight>=CONCLUSION_VERY_HIGH:operations.append('仓位高')
-        elif weight>=CONCLUSION_HIGH:operations.append('仓位较高')
-        if active and op_status!='baseline':
-            operations.append('回撤提醒后的操作待核实' if flow is None else '回撤提醒后不降反升' if flow>=CONCLUSION_FLOW else '回撤提醒后已减仓' if flow<=-CONCLUSION_FLOW else '回撤提醒后未减仓')
-        both={i['symbol'] for i in f['buys']} & {i['symbol'] for i in f['sells']+f['closes']}
-        groups=[([i for i in f['buys'] if i['symbol'] in both],'双向'),
-                ([i for i in f['buys'] if i['symbol'] not in both],'仍在买入'),
-                ([i for i in f['sells'] if i['symbol'] not in both],'减持'),
-                ([i for i in f['closes'] if i['symbol'] not in both],'清仓')]
-        for group,verb in groups:
-            if verb=='双向' and group:
-                if len(group)>budget or len(group)>=CONCLUSION_MANY:operations.append('今日在多只已提醒的持仓上有买有卖')
-                else:operations.append('今日在已提醒的'+'、'.join(i['name'] for i in take(group))+' 上有买有卖')
-                continue
-            if not group:continue
-            already=[i for i in group if i['symbol'] in used]
-            group=[i for i in group if i['symbol'] not in used]
-            if already:operations.append('今日也'+verb+'上述已提醒持仓')
-            if not group:continue
-            if len(group)>budget or len(group)>=CONCLUSION_MANY:
-                operations.append('今日'+verb+'多只已提醒的持仓')
-            else:
-                chosen=take(group)
-                if chosen:operations.append('今日'+verb+'已提醒的'+'、'.join(i['name'] for i in chosen))
-                if len(chosen)<len(group):operations.append('今日'+verb+'多只已提醒的持仓')
-        if f['trade_unknown'] and not f['first']:operations.append('今日成交提醒状态待核实')
-    tail='注意风险。' if active and not status.startswith('观察') and f['weight'] is not None and f['weight']>=CONCLUSION_HIGH and (flow is None or flow>-CONCLUSION_FLOW) else ''
-    return '；'.join(x for x in (nav,holding,'，'.join(operations)) if x)+'。'+tail
+                operation+='，首次提醒以来累计'+flow(f['net'])
+                operation+='，'+('回撤提醒后不降反升' if f['net']>=CONCLUSION_FLOW else '回撤提醒后已减仓' if f['net']<=-CONCLUSION_FLOW else '回撤提醒后未减仓')
+    parts.append(operation)
+    if warn:parts.append('注意风险')
+    return [['今日结论','；'.join(parts).replace(' 未知','未知').replace(' 待核实','待核实')]]
 
 
 def page_facts(result):
@@ -585,28 +645,36 @@ def page_facts(result):
     dragging=sorted((i for i in rest if i['stats']['contribution_pp'] is not None and i['stats']['contribution_pp']<0),key=lambda i:(i['stats']['contribution_pp'],i['symbol']))
     dragging+=sorted((i for i in rest if i['stats']['baseline_day']),key=lambda i:(i['score'] is None,-(i['score'] or ZERO),i['symbol']))
     for item in dragging[:3]:
-        item['reason']='首日已在线外' if day==min(result['days']) else '拖累最大'
+        item['reason']='首日已在警示线外' if day==min(result['days']) else '拖累最大'
         selected.append(item);seen.add(item['symbol'])
     folded=[i for i in items if i['symbol'] not in seen]
     if len(folded)<=3:
         for item in folded:item['reason']='持续提醒';selected.append(item)
         folded=[]
     if day==min(result['days']):
-        for item in selected:item['reason']='首日已在线外'
+        for item in selected:item['reason']='首日已在警示线外'
     op=operation_facts(result,fund['start']) if fund['active'] else None
     def simple(i,upgrade=False):
         s=next(s for rule in ('loss','fall','guard') for s in i['states'] if s['rule']==rule and (s['status'] in UPGRADES if upgrade else rule=='loss'))
-        return dict(symbol=i['symbol'],name=i['name'],line=result['rules'][s['rule']][s['tier']-1],rule=s['rule'],status=s['status'])
+        return dict(symbol=i['symbol'],name=i['name'],weight=i['weight'],loss_rate=i['loss_rate'],line=result['rules'][s['rule']][s['tier']-1],rule=s['rule'],status=s['status'])
     losses=[simple(i) for i in items if any(s['rule']=='loss' and s['tier'] for s in i['states'])]
     cleared=[dict(symbol=s,name=f['names'].get(s,s)) for s,states in sorted(data['states'].items()) if any(t['status']=='解除' for t in states.values()) and not any(t['active'] for t in states.values())]
-    cf=dict(fund=fund,fund_line=result['rules']['fund'][(fund['tier'] or 1)-1],fund_first_line=result['rules']['fund'][0],loss_first_line=result['rules']['loss'][0],
+    calendar=sorted(result['accounts']);dates=calendar[-5:]
+    five_base=max((d for d in calendar if d<dates[0]),default='') if len(dates)==5 else ''
+    compare_date=fund['start'] if fund['active'] and fund['start']<day else five_base
+    compare_account=result['accounts'].get(compare_date)
+    cf=dict(today=day,peak=data['fund']['peak_date'],nav_count=len(calendar),fund_lines=result['rules']['fund'],
+        drawdown_days=fs['visible_days'],nav_return=nav_return,base=base,base_outside_window=base<calendar[-60:][0],
+        compare_date=compare_date,compare_weight=od.pct(compare_account['股票资产'],od.denominator_assets(compare_account)) if compare_account else None,
+        trades=trades,alert_net=op['alert_net'] if op else None,
+        fund=fund,fund_line=result['rules']['fund'][(fund['tier'] or 1)-1],fund_first_line=result['rules']['fund'][0],loss_first_line=result['rules']['loss'][0],
         streak=data['fund']['streak'],daily_return=f['daily_return_pct'],first=day==min(result['days']),total=len(data['held']),losses=losses,
         upgrades=[simple(i,True) for i in upgrades],near=near,cleared=cleared,weight=f['stock_weight_pct'],net=op['net'] if op else None,
         operation_status=op['status'] if op else 'baseline',
         buys=[t for t in trades if t['verified'] and t['alerted'] and t['side']=='买入'],
         sells=[t for t in trades if t['verified'] and t['alerted'] and t['side']=='卖出' and not t['closed']],
         closes=[t for t in trades if t['verified'] and t['alerted'] and t['closed']],
-        trade_unknown=any(not t['verified'] or t['alerted'] is None for t in trades),
+        trade_unknown=any(t['alerted'] is None for t in trades),
         holding_unknown=any(s['metric'] is None for i in items for s in i['states']))
     return dict(date=day,name=result['name'],fund=dict(state=fund,stats=fs,nav_return_pct=nav_return,operations=op),items=items,
         upgrades=upgrades,upgrade_folded=[],continuing=dragging[:3],folded=folded,pending=pending,selected=selected,near=near,trades=trades,conclusion_facts=cf)
@@ -627,23 +695,44 @@ def remaining_text(items):
         if loss:label=f"浮亏超 {RULES['loss'][loss['tier']-1]}%"
         elif any(s['rule']=='fall' and s['tier'] for s in states):label='近 5 日跌幅超 10%'
         elif any(s['rule']=='guard' and s['tier'] for s in states):label='盈利保护'
-        elif all(s['status'].startswith('观察') for s in states):label='回到线内观察中'
+        elif all(s['status'].startswith('观察') for s in states):label='回到警示线内观察中'
         else:label='待核实'
         groups[label].append(item['name'])
-    labels=[f'浮亏超 {n}%' for n in reversed(RULES['loss'])]+['近 5 日跌幅超 10%','盈利保护','回到线内观察中','待核实']
+    labels=[f'浮亏超 {n}%' for n in reversed(RULES['loss'])]+['近 5 日跌幅超 10%','盈利保护','回到警示线内观察中','待核实']
     weight=sum((i['weight'] for i in items),ZERO) if all(i['weight'] is not None for i in items) else None
     return '合计仓位 '+fmt(weight)+'；'+'；'.join(label+'：'+'、'.join(groups[label]) for label in labels if groups[label])
 
 
+def trade_annotation(t):
+    behavior=t.get('behavior','');deviation=t['deviation'];reason=t.get('skip_reason','')
+    price=t['side']+'均价'
+    sign=1 if t['side']=='买入' else -1
+    favorable=''
+    if deviation is not None and deviation*sign<=-TRADE_DEVIATION_PCT:
+        favorable=price+('高于' if deviation>0 else '低于')+f"收盘 {abs(deviation):.1f}%"
+    if reason:return '未判追涨杀跌（'+reason+'）'+('，'+favorable if favorable else '')
+    if behavior in ('追涨','杀跌'):
+        text=behavior+'：'+price+f"较昨收 {t['relative']:+.1f}%"
+        sign=1 if t['side']=='买入' else -1
+        if trade_direction(t['side'],t['relative']) and deviation*sign>=TRADE_DEVIATION_PCT:
+            text+=('，高于' if sign==1 else '，低于')+f"收盘 {abs(deviation):.1f}%"
+        return text+('，'+favorable.removeprefix(price) if favorable else '')
+    if behavior:return behavior+'：'+price+('高于' if deviation>0 else '低于')+f"收盘 {abs(deviation):.1f}%"
+    # Favorable deviations remain facts even when the behavior band is unknown.
+    if deviation is not None and abs(deviation)>=TRADE_DEVIATION_PCT:
+        return price+('高于' if deviation>0 else '低于')+f"收盘 {abs(deviation):.1f}%"
+    if t.get('closed') and t['side']=='卖出' and deviation is None:return '未判追涨杀跌（收盘价未取到）'
+    return ''
+
+
 def today_trades_text(view,result):
     selected={i['symbol'] for i in view['selected']};groups=defaultdict(list);briefs=defaultdict(list);counts=defaultdict(int)
-    for t in view['trades']:
+    ordered=sorted(view['trades'],key=lambda t:t.get('behavior') not in ('追涨','杀跌'))
+    for t in ordered:
         if not t['verified']:
             groups['待核实'].append(t['name']+' 成交待核实');briefs['待核实'].append(t['name']);continue
         label='清仓' if t['closed'] and t['side']=='卖出' else t['side']
-        deviation=''
-        if t['deviation'] is not None and abs(t['deviation'])>=TRADE_DEVIATION_PCT:
-            deviation=t['side']+'均价'+('高于' if t['deviation']>0 else '低于')+f"收盘 {abs(t['deviation']):.1f}%"
+        deviation=trade_annotation(t)
         if t['symbol'] in selected:
             text=t['name']+'（见重点持仓'+('，'+deviation if deviation else '')+'）'
         else:
@@ -669,27 +758,25 @@ def today_trades_text(view,result):
             groups[label].append(text)
             if t['symbol'] not in selected:counts[label]+=1
         else:briefs[label].append(t['name']+('（'+deviation+'）' if deviation else ''))
-    return '；'.join(label+'：'+'；'.join(values)+('；其余：'+'、'.join(briefs[label]) if briefs[label] else '') for label in ('买入','卖出','清仓','待核实') if (values:=groups[label]))
+    flagged=[t for t in view['trades'] if t.get('behavior') in ('追涨','杀跌') and t['verified']]
+    total=sum((t.get('amount_rmb',ZERO) for t in view['trades']),ZERO)
+    summary=''
+    if flagged and total>0:
+        buys=len({t['symbol'] for t in flagged if t['behavior']=='追涨'})
+        sells=len({t['symbol'] for t in flagged if t['behavior']=='杀跌'})
+        share=sum((t['amount_rmb'] for t in flagged),ZERO)/total*100
+        sides=[f'追涨 {buys} 只'] if buys else []
+        if sells:sides.append(f'杀跌 {sells} 只')
+        summary='、'.join(sides)+('，合计占' if buys and sells else '，占')+f'今日成交额 {share:.0f}%；'
+    return summary+'；'.join(label+'：'+'；'.join(values)+('；其余：'+'、'.join(briefs[label]) if briefs[label] else '') for label in ('买入','卖出','清仓','待核实') if (values:=groups[label]))
 
 
 def build_view(result,index=None):
     view=page_facts(result);day=result['as_of'];data=result['days'][day];f=data['facts'];fund=view['fund']['state']
     index=index or read_index(None,day);has_index=index['status']=='valid';calendar=sorted(result['accounts']);base=fund['baseline'] or data['fund']['peak_date']
     peak=data['fund']['peak_date'];fs=view['fund']['stats'];early=base<min(result['days'])
-    label=f'有记录以来高点（{peak}）' if len(calendar)<60 else f'{peak} 高点'
-    fund_text=f'距{label}回撤 {fmt(fund["metric"])}；'+state_text(fund,result['rules']['fund'])
-    if fund['active']:
-        distance=next_distance(fund,result['rules']['fund'])
-        if distance is not None:fund_text+=f"；距 {result['rules']['fund'][fund['tier']]}% 线 "+fmt(distance,' 个百分点')
-        if base!=peak:fund_text+=f"；本段高点 {base} 以来净值 "+fmt(view['fund']['nav_return_pct'],signed=True,baseline=base==day)
-        fund_text+=f"；高点以来第 {fs['visible_days']} 个估值日"
-        if data['fund']['streak']!=0:fund_text+='；连跌 '+str(data['fund']['streak'] if data['fund']['streak'] is not None else '未知')+' 日'
-        if base<calendar[-60:][0]:fund_text+='；本段高点已移出 60 日窗口，累计基准不变'
-        if has_index:fund_text+='；同期沪深300 '+fmt(index_return(index,base,day),signed=True,baseline=base==day)
-    view['fund']['text']=fund_text
-    headline='今日有升级事项' if view['upgrades'] or fund['status'] in UPGRADES else '今日有提醒解除' if view['conclusion_facts']['cleared'] or fund['status']=='解除' else '今日无升级事项'
-    if not all(data['coverage'].values()):headline='数据不全，'+headline
-    rows=[['产品概览',f'{day} 收盘｜'+headline+('（模拟数据）' if any(e['simulated'] for e in result['exports']) else '')]]
+    headline='｜数据不全' if not all(data['coverage'].values()) else ''
+    rows=[['产品概览',f'{day} 收盘'+headline+('（模拟数据）' if any(e['simulated'] for e in result['exports']) else '')]]
     if f.get('cash_excluded'):
         rows.extend(['数据提示',p.split('：',1)[1]] for p in render.render_day(f).split('\n\n') if p.startswith('数据提示：'))
     if render.share_note(f):rows.append(['申赎说明',render.share_note(f)])
@@ -700,29 +787,23 @@ def build_view(result,index=None):
     nav[0].append('5 日累计');nav[1].append('—');nav[2].append(fmt(five,signed=True))
     nav.append(['','股票仓位',*[fmt(od.pct(result['accounts'][d]['股票资产'],od.denominator_assets(result['accounts'][d]))) for d in dates],'—'])
     if has_index:nav.append(['','沪深300当日涨跌',*[fmt(index_return(index,prior(d),d),signed=True) for d in dates],fmt(index_return(index,five_base,day),signed=True)])
-    rows.extend(nav);rows.extend([['今日结论',conclusion(view['conclusion_facts'])],['净值回撤',fund_text]])
+    view['conclusion_facts'].update(five_base=five_base,five=five,has_index=has_index,
+        index_today=index_return(index,prior(day),day) if has_index else None,
+        index_five=index_return(index,five_base,day) if has_index else None,
+        index_base=index_return(index,base,day) if has_index else None)
+    summaries=conclusion(view['conclusion_facts'])
+    view['fund']['text']=summaries[0][1]
+    rows.extend(nav);rows.extend(summaries)
     names={s:h['证券名称'] for d in result['days'].values() for s,h in (d['held'] or {}).items()}
     chosen={i['symbol']:i for i in view['selected']}
     if fund['active']:
-        start=fund['start'];op=view['fund']['operations'];weights={}
-        for when,title in [(base,'高点日'),(start,'首次提醒日'),(day,'今日')]:
-            weights.setdefault(when,[]).append(title)
-        comparisons=[]
-        for d,titles in weights.items():
-            known=result['days'].get(d)
-            weight=od.pct(known['account']['股票资产'],od.denominator_assets(known['account'])) if known and known['held'] is not None else None
-            comparisons.append(fmt(weight)+'（'+'、'.join(titles)+(' '+d if '今日' not in titles else '')+'）')
-        text='股票仓位 '+' → '.join(comparisons)
-        if early:text+='；高点日早于持仓记录，期间仓位变化与成交未知'
-        if start==day:text+='；今日首次提醒'
-        else:
-            value='未知' if op['status']=='missing' else '待核实' if op['status']=='unverified' else fmt(op['net'],' 个百分点',signed=True)
-            text+='；首次提醒以来净买入占比累计 '+value+'，其中已提醒持仓 '+(fmt(op['alert_net'],' 个百分点',signed=True) if op['alert_net'] is not None else '待核实')
+        start=fund['start'];op=view['fund']['operations']
+        lists=[]
+        if start<day and op['status']=='known':
             for sign,title in ((1,'净买入最多'),(-1,'净卖出最多')):
                 top=sorted(((s,v) for s,v in op['by_symbol'].items() if v*sign>0),key=lambda x:(-abs(x[1]),x[0]))[:3]
-                if top:text+='；'+title+'：'+'、'.join(names.get(s,s)+('（见重点持仓）' if s in chosen and chosen[s]['baseline']==start else ' '+fmt(v,' 个百分点',signed=True)) for s,v in top)
-        if day==min(result['days']) and fund['status']=='已在档内':text='账本首日净值已在回撤提醒中，此前的仓位变化和成交未知'
-        rows.append(['回撤期间操作',text])
+                if top:lists.append(title+'：'+'、'.join(names.get(s,s)+('（见重点持仓）' if s in chosen and chosen[s]['baseline']==start else ' '+fmt(v,' 个百分点',signed=True)) for s,v in top))
+        if lists:rows.append(['回撤期间操作','首次提醒以来'+'；'.join(lists)])
         if not early:
             symbols={s for d in result['days'].values() if d['date']>=base for s in (d['held'] or {})}
             drag=[(s,cumulative(result,base,s)['contribution_pp']) for s in symbols]
@@ -733,7 +814,7 @@ def build_view(result,index=None):
     if data['held']:rows.append(['今日盈亏',pnl_text(data)])
     if view['selected']:
         rows.append(['重点持仓',''])
-        header=['入选原因','持仓','状态','','','今日仓位（%）','浮盈亏（%）','提醒开始日','提醒日仓位（%）','提醒以来股价（%）','日贡献累计（百分点）','提醒以来操作（净买入占比累计，百分点）','近 5 日股价（%）','连跌日数','距下一浮亏线（百分点）']
+        header=['入选原因','持仓','状态','','','今日仓位（%）','浮盈亏（%）','提醒开始日','提醒日仓位（%）','提醒以来股价（%）','日贡献累计（百分点）','提醒以来操作（净买入占比累计，百分点）','近 5 日股价（%）','连跌日数','距下一条浮亏警示线（百分点）']
         if has_index:header.insert(10,'同期沪深300（%）')
         rows.append(header)
         for item in view['selected']:
@@ -752,13 +833,13 @@ def build_view(result,index=None):
     first=day==min(result['days'])
     if first:gaps.append('账本首日：持仓历史从 '+day+' 起，此前的成交、个股仓位和各项累计未知')
     labels={row[0] for row in rows}
-    affected=[label for label in ('回撤期间操作','回撤期间拖累','今日盈亏','重点持仓','今日成交') if label in labels]
+    affected=[label for label in ('今日结论','回撤期间操作','回撤期间拖累','今日盈亏','重点持仓','今日成交') if label in labels]
     missing_exports=[d['date'] for d in result['days'].values() if d['held'] is None]
     if missing_exports:gaps.append('、'.join(missing_exports)+' 缺持仓、成交导出；受影响：'+'、'.join(affected))
     if not prior(dates[0]):gaps.append('近 5 日表首日（'+dates[0]+'）缺前一日净值')
     elif not five_base:gaps.append('截至 '+day+' 净值不足六个估值日；受影响：近 5 日表累计')
     dividends=[d for d,a in assets.items() if a['单位分红金额'] and (not five_base or five_base<d<=day)]
-    if dividends:gaps.append('、'.join(dividends)+' 有分红，前后净值不可比；受影响：近 5 日表累计、净值回撤')
+    if dividends:gaps.append('、'.join(dividends)+' 有分红，前后净值不可比；受影响：近 5 日表累计、今日结论')
     unverified=[d['date'] for d in result['days'].values() if any(not okay for okay in d['verified'].values())]
     if unverified:gaps.append('、'.join(unverified)+' 成交与持仓未核对；受影响：'+'、'.join(affected))
     if index['status']=='invalid':gaps.append('指数文件有误，未使用；受影响：沪深300各项')
@@ -767,11 +848,11 @@ def build_view(result,index=None):
         if fund['active']:required.add(base)
         required.update(i['baseline'] for i in view['selected'])
         missing=sorted(d for d in required if d and d not in index['values'])
-        if missing:gaps.append('沪深300缺日期 '+ '、'.join(missing)+'；受影响：近 5 日表、净值回撤、重点持仓的同期指数')
+        if missing:gaps.append('沪深300缺日期 '+ '、'.join(missing)+'；受影响：近 5 日表、今日结论、重点持仓的同期指数')
     if not first:
         short=[i['name'] for i in view['selected'] if i['five_day'] is None]
         if short and not missing_exports:gaps.append(day+' 持仓价格不足五个估值日：'+'、'.join(short)+'；受影响：重点持仓的近 5 日股价')
-        if early and fund['active']:gaps.append(base+' 高点日早于持仓记录起始日 '+min(result['days'])+'；受影响：回撤期间操作、回撤期间拖累')
+        if early and fund['active']:gaps.append(base+' 高点日早于持仓记录起始日 '+min(result['days'])+'；受影响：今日结论'+('、回撤期间操作' if '回撤期间操作' in labels else '')+'、回撤期间拖累')
     grouped_gaps=[];affected_groups={}
     for gap in dict.fromkeys(gaps):
         reason,separator,affected_names=gap.partition('；受影响：')
@@ -785,7 +866,7 @@ def build_view(result,index=None):
     if grouped_gaps:rows.append(['数据覆盖','；'.join(grouped_gaps)])
     weights=f['weights'];ranked=sorted((s for s,w in weights.items() if w is not None and w>0),key=lambda s:(-weights[s],s))
     concentration=('第一大 '+f['names'][ranked[0]]+' '+fmt(weights[ranked[0]])+'；前三 '+fmt(sum((weights[s] for s in ranked[:3]),ZERO))+'；前五 '+fmt(sum((weights[s] for s in ranked[:5]),ZERO))) if ranked else '无股票持仓'
-    view['footer']=[['总仓位',f"股票 {fmt(f['stock_weight_pct'])}；现金 {fmt(f['cash_weight_pct'])}"],['个股仓位',concentration],['总盈亏','见产品概览“净值回撤”'],['个股盈亏','见产品概览“重点持仓”，逐只状态见风控提示列' if data['held'] else '无股票持仓']]
+    view['footer']=[['总仓位',f"股票 {fmt(f['stock_weight_pct'])}；现金 {fmt(f['cash_weight_pct'])}"],['个股仓位',concentration],['总盈亏','见产品概览“今日结论”'],['个股盈亏','见产品概览“重点持仓”，逐只状态见风控提示列' if data['held'] else '无股票持仓']]
     view['overview']=[[re.sub(r'[+-]0\.00(?!\d)','0.00',cell) for cell in row] for row in rows]
     view['index']=index
     view['claims']=presentation_claims(result,view)
@@ -804,42 +885,36 @@ def presentation_claims(result,view):
         for n,row in enumerate(view[source]):
             label=row[0];text=' | '.join(row[1:]);kind='single';obj='fund';metric=label
             start=end=day
-            if label in ('产品概览','今日结论','重点持仓','入选原因','数据覆盖','持仓历史','总盈亏','个股盈亏'):continue
+            if label in ('产品概览','重点持仓','入选原因','数据覆盖','持仓历史','总盈亏','个股盈亏'):continue
             if label=='近5日':dates=row[2:-1];continue
             if label=='':
                 metric=row[1];kind='series';start=dates[0]
             elif label in FOCUS_REASONS and len(row)>2:
                 obj=by_name[row[1]]['symbol'];metric='holding_review';start=by_name[row[1]]['baseline'];kind='comparison'
+            elif label=='今日结论':kind='summary'
             elif label=='回撤期间操作':kind='comparison';start=view['fund']['state']['baseline']
             claim=dict(identity=identity(obj,metric,start,end,'statement'),kind=kind,text=text,members=[])
             claims.append(claim)
             cell=[source,n,1]
-            if label=='净值回撤':
-                peak=result['days'][day]['fund']['peak_date']
-                member(claim,'fund','drawdown',cell,r'回撤 ([0-9.]+)%',peak)
+            if label=='今日结论':
+                cf=view['conclusion_facts']
+                pattern=r'回撤 ([0-9.]+)%'
+                if re.search(pattern,row[1]):member(claim,'fund','drawdown',cell,pattern,start=cf['peak'],kind='summary')
             elif label=='总仓位':
-                member(claim,'fund','stock_weight',cell,r'股票 ([0-9.]+)%')
-                member(claim,'fund','cash_weight',cell,r'现金 ([0-9.]+)%')
+                if re.search(r'股票 ([0-9.]+)%',row[1]):member(claim,'fund','stock_weight',cell,r'股票 ([0-9.]+)%')
+                if re.search(r'现金 ([0-9.]+)%',row[1]):member(claim,'fund','cash_weight',cell,r'现金 ([0-9.]+)%')
             elif label=='个股仓位':
                 ranks=sorted((s for s,w in result['days'][day]['facts']['weights'].items() if w is not None and w>0),key=lambda s:(-result['days'][day]['facts']['weights'][s],s))
                 if ranks:member(claim,ranks[0],'weight',cell,r'第一大 .*? ([0-9.]+)%',kind='comparison')
-                for title,num in [('前三',3),('前五',5)]:member(claim,'fund','top_'+str(num)+'_weight',cell,title+r' ([0-9.]+)%')
+                if ranks:
+                    for title,num in [('前三',3),('前五',5)]:member(claim,'fund','top_'+str(num)+'_weight',cell,title+r' ([0-9.]+)%')
             elif label=='':
                 for j,d in enumerate(dates,2):
                     metric={'股票仓位':'stock_weight','单位净值':'nav','当日涨跌':'daily_return','沪深300当日涨跌':'index_return'}[row[1]]
                     if row[j] not in ('未知','—'):
                         member(claim,'index' if metric=='index_return' else 'fund',metric,[source,n,j],r'^([+\-]?[0-9.]+)%?$',start=d,end=d,basis='nav' if metric=='nav' else 'percent',kind='series')
-            elif label=='回撤期间操作':
-                state=view['fund']['state'];weights={}
-                for d,title in [(state['baseline'],'高点日'),(state['start'],'首次提醒日'),(day,'今日')]:weights.setdefault(d,[]).append(title)
-                for d,titles in weights.items():
-                    title='、'.join(titles)+(' '+d if '今日' not in titles else '')
-                    pattern=r'([0-9.]+)%（'+re.escape(title)+'）'
-                    if re.search(pattern,row[1]):member(claim,'fund','stock_weight',cell,pattern,start=d,end=d,kind='comparison')
-                if state['start']<day:
-                    for word,metric in [('净买入占比累计','net_flow'),('其中已提醒持仓','alert_net_flow')]:
-                        pattern=word+r' ([+\-]?[0-9.]+) 个百分点'
-                        if re.search(pattern,row[1]):member(claim,'fund',metric,cell,pattern,start=state['start'],basis='pp')
+                if row[1] in ('当日涨跌','沪深300当日涨跌') and row[-1] not in ('未知','—'):
+                    member(claim,'index' if row[1]=='沪深300当日涨跌' else 'fund','five_day_return',[source,n,len(row)-1],r'^([+\-]?[0-9.]+)%$',start=view['conclusion_facts']['five_base'],kind='series')
             elif label in FOCUS_REASONS and len(row)>2:
                 item=by_name[row[1]];s=item['symbol'];start=item['baseline'];offset=int(view['index']['status']=='valid')
                 fields=[(5,'weight',day,'percent'),(6,'pnl_rate',day,'percent'),(8,'weight',start,'percent'),(9,'price_return',start,'percent'),(10+offset,'contribution',start,'pp'),(12+offset,'five_day_price',day,'percent'),(14+offset,'next_loss_distance',day,'pp')]
@@ -974,7 +1049,7 @@ def archive_receipts(ledger, as_of):
             for day in sorted(archives) if day<=as_of]
 
 
-def batch_pages(ledger, as_of, *, index_dir=None):
+def batch_pages(ledger, as_of, *, index_dir=None, bars_dir=None, bars_fetcher=None, monotonic=None, clock=None):
     """Parse each selected export once. Only product calculation errors are isolated."""
     ledger=Path(ledger);exports,receipts=selected_exports(ledger,as_of);index=read_index(index_dir,as_of)
     products=sorted({r.get('产品序号') for r in exports[-1]['tables']['asset'][2] if not od.is_total(r) and r.get('产品序号')})
@@ -990,34 +1065,47 @@ def batch_pages(ledger, as_of, *, index_dir=None):
                 if row.get('产品序号') in by_product:by_product[row['产品序号']].append(row)
             for p in products:tables[p][kind]=(sheet,header,by_product[p])
         for p in products:grouped[p].append(dict(export,tables=tables[p]))
-    pages={};errors={}
+    pages={};errors={};results={};needed=set()
     for fid in products:
         try:
             result=replay_exports(grouped[fid],receipts,as_of,fid)
-            view=build_view(result,index);content=product_csv(result,view)
-            pages[fid]=dict(result=result,view=view,csv=content,options=workbook_options(content,index))
+            required={t['symbol'] for t in trade_facts(result) if t['closed'] and t['verified']}
+            results[fid]=result;needed.update(required)
         except Exception as err:
             # This block only computes in memory; archive reads and writes are outside.
             errors[fid]=type(err).__name__+': '+str(err)
-    od.require(archive_receipts(ledger,as_of)==receipts,'input changed during processing')
-    od.require(read_index(index_dir,as_of)['files']==index['files'],'index changed during processing')
-    return dict(pages=pages,errors=errors,names=names,index=index,receipts=receipts)
+    needed=sorted(needed)
+    bar_errors={}
+    if bars_dir is not None and bars_fetcher is not None and needed:
+        bar_errors=fetch_bars.run(bars_dir,needed,as_of,fetcher=bars_fetcher,monotonic=monotonic,
+                                 now=(clock or fetch_bars.fetch_index.east8_now)())
+    bars={s:fetch_bars.read_pair(bars_dir,s,as_of) if bars_dir is not None else [] for s in needed}
+    for fid,result in results.items():
+        try:
+            result['bars']={s:bars[s] for s in needed if s in result['days'][as_of]['trades'] and s not in result['days'][as_of]['held']}
+            view=build_view(result,index);content=product_csv(result,view)
+            pages[fid]=dict(result=result,view=view,csv=content,options=workbook_options(content,index))
+        except Exception as err:errors[fid]=type(err).__name__+': '+str(err)
+    validate_sources(ledger,as_of,receipts,index_dir,index,bars_dir=bars_dir,bars=bars)
+    return dict(pages=pages,errors=errors,names=names,index=index,receipts=receipts,bars=bars,bar_errors=bar_errors)
 
 
-def validate_sources(ledger, as_of, receipts, index_dir, index):
+def validate_sources(ledger, as_of, receipts, index_dir, index, *, bars_dir=None, bars=None):
     od.require(archive_receipts(Path(ledger),as_of)==receipts,'input changed during processing')
     od.require(read_index(index_dir,as_of)['files']==index['files'],'index changed during processing')
+    if bars_dir is not None and bars is not None:
+        od.require({s:fetch_bars.read_pair(bars_dir,s,as_of) for s in bars}==bars,'bars changed during processing')
 
 
-def run_all(ledger, as_of, out, *, index_dir=None):
+def run_all(ledger, as_of, out, *, index_dir=None, bars_dir=None):
     import os
     ledger=Path(ledger);out=Path(out)
     od.require(out.resolve()!=ledger.resolve() and ledger.resolve() not in out.resolve().parents,'output inside ledger')
-    batch=batch_pages(ledger,as_of,index_dir=index_dir);outputs={}
+    batch=batch_pages(ledger,as_of,index_dir=index_dir,bars_dir=bars_dir);outputs={}
     out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.batch-',dir=out) as temp:
         staged={fid:write_page(page['result'],page['view'],Path(temp)/fid) for fid,page in batch['pages'].items()}
-        validate_sources(ledger,as_of,batch['receipts'],index_dir,batch['index'])
+        validate_sources(ledger,as_of,batch['receipts'],index_dir,batch['index'],bars_dir=bars_dir,bars=batch['bars'])
         for fid,folder in staged.items():
             target=out/fid/folder.name;target.parent.mkdir(exist_ok=True)
             if target.exists():
@@ -1027,13 +1115,16 @@ def run_all(ledger, as_of, out, *, index_dir=None):
     return dict(outputs=outputs,errors=batch['errors'])
 
 
-def run(ledger, as_of, fid, out, rules=None, *, index_dir=None, points_file=None):
+def run(ledger, as_of, fid, out, rules=None, *, index_dir=None, points_file=None, bars_dir=None):
     ledger=Path(ledger);out=Path(out)
     od.require(out.resolve()!=ledger.resolve() and ledger.resolve() not in out.resolve().parents, 'output inside ledger')
-    result=replay_ledger(ledger,as_of,fid,rules);index=read_index(index_dir,as_of);view=build_view(result,index)
+    result=replay_ledger(ledger,as_of,fid,rules);index=read_index(index_dir,as_of)
+    needed={t['symbol'] for t in trade_facts(result) if t['closed'] and t['verified']}
+    result['bars']={s:fetch_bars.read_pair(bars_dir,s,as_of) if bars_dir is not None else [] for s in sorted(needed)}
+    view=build_view(result,index)
     od.require(archive_receipts(ledger,as_of)==result['receipts'],'input changed during processing')
     od.require(read_index(index_dir,as_of)['files']==index['files'],'index changed during processing')
-    return write_page(result,view,out,points_file=points_file,validate=lambda:validate_sources(ledger,as_of,result['receipts'],index_dir,index))
+    return write_page(result,view,out,points_file=points_file,validate=lambda:validate_sources(ledger,as_of,result['receipts'],index_dir,index,bars_dir=bars_dir,bars=result['bars']))
 
 
 def write_page(result, view, out, *, points_file=None, validate=None):
@@ -1045,8 +1136,8 @@ def write_page(result, view, out, *, points_file=None, validate=None):
     validation=None
     if points_bytes is not None:
         validation=validate_points(json.loads(points_bytes),facts)
-    code={name:daily.digest((Path(__file__).parent/name).read_bytes()) for name in (*daily.CODE,'homepage_v2.py','manager_workbook.py')}
-    identity=dict(format='homepage-v2-round4',as_of=as_of,product=fid,inputs=result['receipts'],rules=result['rules'],code=code,index=index['files'],points=daily.digest(points_bytes) if points_bytes is not None else None)
+    code={name:daily.digest((Path(__file__).parent/name).read_bytes()) for name in (*daily.CODE,'homepage_v2.py','manager_workbook.py','fetch_bars.py')}
+    identity=dict(format='homepage-v2-round4',as_of=as_of,product=fid,inputs=result['receipts'],rules=result['rules'],code=code,index=index['files'],bars=result.get('bars',{}),points=daily.digest(points_bytes) if points_bytes is not None else None)
     identity_bytes=daily.encoded(identity);key=daily.digest(identity_bytes)
     target=out/key
     payload={'MANIFEST.json':identity_bytes,'facts.json':daily.encoded(view),'PAGES.md':render_view(view).encode(),

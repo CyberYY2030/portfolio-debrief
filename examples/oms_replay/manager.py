@@ -18,6 +18,7 @@ from datetime import date, timedelta
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import daily
 import fetch_index
+import fetch_bars
 import homepage_v2 as hp
 from manager_workbook import write_workbook
 
@@ -62,10 +63,12 @@ def output_lock(output):
         yield
 
 
-def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, index_messages=None):
+def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, index_messages=None,
+             bars_fetcher=None, monotonic=None, bars_messages=None):
     validate(source, output)
     ledger = output / '每日账本'
     index_dir = Path(index_dir) if index_dir is not None else output / '指数'
+    bars_dir = output / '行情'
     with output_lock(output):
         summary = daily.run(source, ledger)
         fields = dict(item.split('=', 1) for item in summary.split()[1:])
@@ -92,7 +95,13 @@ def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, 
                 if index_messages is not None:
                     index_messages.append(message)
         # Archive integrity and parsing happen outside the per-product fallback boundary.
-        batch = hp.batch_pages(ledger, day, index_dir=index_dir)
+        batch = hp.batch_pages(ledger, day, index_dir=index_dir, bars_dir=bars_dir,
+                               bars_fetcher=bars_fetcher, monotonic=monotonic, clock=clock)
+        bars_message = fetch_bars.failure_message(batch['bar_errors'])
+        if bars_message:
+            print(bars_message)
+            if bars_messages is not None:
+                bars_messages.append(bars_message)
         filenames = daily.product_filenames(batch['names'], day, max_units=daily.filename_budget(ledger, version))
         if set(filenames.values()) != {f.name for f in sheets}:
             raise UserError('产品与账本持仓表不一致，已停止生成。')
@@ -115,9 +124,9 @@ def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, 
                 payload[name] = (buffer.getvalue().encode('utf-8'), {'explanation': True})
         receipt = {'source': {f.name: sha256(f.read_bytes()).hexdigest() for f in sheets},
                    'v2': {name: sha256(content).hexdigest() for name, (content, _) in payload.items()},
-                   'index': batch['index']['files'], 'failures': warnings,
+                   'index': batch['index']['files'], 'bars': batch['bars'], 'failures': warnings,
                    'code': {name: sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                            for name in ('homepage_v2.py', 'manager_workbook.py', 'manager.py', 'fetch_index.py')}}
+                            for name in ('homepage_v2.py', 'manager_workbook.py', 'manager.py', 'fetch_index.py', 'fetch_bars.py')}}
         parent = output / '持仓表' / day
         editions = sorted((p for p in parent.glob('第*版') if p.is_dir() and re.fullmatch(r'第[1-9][0-9]*版', p.name)),
                           key=lambda p: int(p.name[1:-1]))
@@ -145,7 +154,8 @@ def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, 
                         write_workbook(source_csv, stage / Path(name).with_suffix('.xlsx'), **options)
                 (stage / marker).write_bytes(daily.encoded(receipt))
                 if warnings: (stage / 'V2_FAILURES.json').write_bytes(daily.encoded(warnings))
-                hp.validate_sources(ledger, day, batch['receipts'], index_dir, batch['index'])
+                hp.validate_sources(ledger, day, batch['receipts'], index_dir, batch['index'],
+                                    bars_dir=bars_dir, bars=batch['bars'])
                 stage.rename(target)
             finally:
                 if stage.exists(): shutil.rmtree(stage)
@@ -215,8 +225,10 @@ def desktop(config, setup=False):
         except (KeyError, TypeError, ValueError) as err:
             raise UserError('保存的目录设置无效，请双击「更改目录」重新选择。') from err
     index_messages = []
+    bars_messages = []
     target, count, rejected = generate(source, output, index_fetcher=fetch_index.run,
-                                       clock=fetch_index.east8_now, index_messages=index_messages)
+                                       clock=fetch_index.east8_now, index_messages=index_messages,
+                                       bars_fetcher=fetch_bars.tencent_fetch, bars_messages=bars_messages)
     message = f'{target.parent.name} · {target.name}\n共 {count} 份 Excel 工作簿。'
     if rejected:
         message += f'其中 {rejected} 份只含数据校验说明，请检查对应导出。'
@@ -225,6 +237,8 @@ def desktop(config, setup=False):
         message += '\n新版首页失败，以下产品已用旧版：\n' + '\n'.join(fid + '：' + reason for fid, reason in failures.items())
     if index_messages:
         message += '\n' + '\n'.join(index_messages)
+    if bars_messages:
+        message += '\n' + '\n'.join(bars_messages)
     notice(message + '\n\n点「确定」打开本次结果文件夹。')
     os.startfile(target)
 
