@@ -588,7 +588,12 @@ def conclusion(f):
             if f['cleared']:change+=f"，{len(f['cleared'])} 只提醒解除"
             if f['holding_unknown']:change+='，部分持仓状态待核实'
         parts.append(change)
-    high=weight is not None and weight>=CONCLUSION_HIGH and (not active or f['net'] is None or f['net']>-CONCLUSION_FLOW)
+    change=weight-f['compare_weight'] if weight is not None and f['compare_weight'] is not None else None
+    assessment=None
+    if f['net'] is not None and change is not None:
+        assessment=('不降反升' if f['net']>=CONCLUSION_FLOW and change>=CONCLUSION_FLOW else
+                    '已减仓' if f['net']<=-CONCLUSION_FLOW and change<=-CONCLUSION_FLOW else '未减仓')
+    high=weight is not None and weight>=CONCLUSION_HIGH and (not active or assessment!='已减仓')
     warn=sum((active and not status.startswith('观察'),broad,high))>=2
     trades=f['trades']
     def flow(value):
@@ -605,7 +610,11 @@ def conclusion(f):
             elif f['operation_status']=='unverified' or f['net'] is None:operation+='，首次提醒以来的操作待核实'
             else:
                 operation+='，首次提醒以来累计'+flow(f['net'])
-                operation+='，'+('回撤提醒后不降反升' if f['net']>=CONCLUSION_FLOW else '回撤提醒后已减仓' if f['net']<=-CONCLUSION_FLOW else '回撤提醒后未减仓')
+                if assessment is None:operation+='，仓位变化待核实'
+                else:
+                    if abs(f['net'])>=CONCLUSION_FLOW and assessment=='未减仓':
+                        operation+='，股票仓位由 '+fmt(f['compare_weight'])+' 到 '+fmt(weight)
+                    operation+='，回撤提醒后'+assessment
     parts.append(operation)
     if warn:parts.append('注意风险')
     return [['今日结论','；'.join(parts).replace(' 未知','未知').replace(' 待核实','待核实')]]
@@ -1035,12 +1044,12 @@ def validate_points(payload, facts):
     return dict(accepted=accepted,decisions=decisions)
 
 
-def workbook_options(content, index):
+def workbook_options(content, index, behavior=None):
     rows=list(csv.reader(io.StringIO(content.decode())))
     nav_start=next(i for i,row in enumerate(rows,1) if row[0]=='近5日' and row[1]=='日期')
     table_rows=[i for i,row in enumerate(rows,1) if row[0] in ('入选原因',*FOCUS_REASONS) and row[2]]
     return dict(nav_start=nav_start,table_rows=table_rows,unsigned_zero=True,state_span=True,
-                nav_count=5 if index['status']=='valid' else 4,nav_cumulative=True,explanation=True)
+                nav_count=5 if index['status']=='valid' else 4,nav_cumulative=True,explanation=True,behavior=behavior)
 
 
 def archive_receipts(ledger, as_of):
@@ -1065,7 +1074,8 @@ def batch_pages(ledger, as_of, *, index_dir=None, bars_dir=None, bars_fetcher=No
                 if row.get('产品序号') in by_product:by_product[row['产品序号']].append(row)
             for p in products:tables[p][kind]=(sheet,header,by_product[p])
         for p in products:grouped[p].append(dict(export,tables=tables[p]))
-    pages={};errors={};results={};needed=set()
+    import behavior_review as br
+    pages={};errors={};results={};needed=set();behavior_errors={}
     for fid in products:
         try:
             result=replay_exports(grouped[fid],receipts,as_of,fid)
@@ -1086,8 +1096,14 @@ def batch_pages(ledger, as_of, *, index_dir=None, bars_dir=None, bars_fetcher=No
             view=build_view(result,index);content=product_csv(result,view)
             pages[fid]=dict(result=result,view=view,csv=content,options=workbook_options(content,index))
         except Exception as err:errors[fid]=type(err).__name__+': '+str(err)
+    for fid,page in pages.items():
+        behavior,error=br.safe_page(page['result'],index,bars_dir)
+        page['behavior']=behavior;page['result']['behavior']=behavior
+        page['options']['behavior']=behavior
+        if error:behavior_errors[fid]=error
+        br.validate_cache(behavior,bars_dir)
     validate_sources(ledger,as_of,receipts,index_dir,index,bars_dir=bars_dir,bars=bars)
-    return dict(pages=pages,errors=errors,names=names,index=index,receipts=receipts,bars=bars,bar_errors=bar_errors)
+    return dict(pages=pages,errors=errors,names=names,index=index,receipts=receipts,bars=bars,bar_errors=bar_errors,behavior_errors=behavior_errors)
 
 
 def validate_sources(ledger, as_of, receipts, index_dir, index, *, bars_dir=None, bars=None):
@@ -1101,18 +1117,20 @@ def run_all(ledger, as_of, out, *, index_dir=None, bars_dir=None):
     import os
     ledger=Path(ledger);out=Path(out)
     od.require(out.resolve()!=ledger.resolve() and ledger.resolve() not in out.resolve().parents,'output inside ledger')
+    import behavior_review as br
     batch=batch_pages(ledger,as_of,index_dir=index_dir,bars_dir=bars_dir);outputs={}
     out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.batch-',dir=out) as temp:
-        staged={fid:write_page(page['result'],page['view'],Path(temp)/fid) for fid,page in batch['pages'].items()}
+        staged={fid:write_page(page['result'],page['view'],Path(temp)/br.storage_name(fid)) for fid,page in batch['pages'].items()}
         validate_sources(ledger,as_of,batch['receipts'],index_dir,batch['index'],bars_dir=bars_dir,bars=batch['bars'])
+        for page in batch['pages'].values():br.validate_cache(page['behavior'],bars_dir)
         for fid,folder in staged.items():
-            target=out/fid/folder.name;target.parent.mkdir(exist_ok=True)
+            target=out/br.storage_name(fid)/folder.name;target.parent.mkdir(exist_ok=True)
             if target.exists():
-                od.require({p.name:p.read_bytes() for p in target.iterdir()}=={p.name:p.read_bytes() for p in folder.iterdir()},'existing v2 output differs')
+                od.require({p.name for p in target.iterdir()}=={p.name for p in folder.iterdir()} and all((target/p.name).read_bytes()==p.read_bytes() for p in folder.iterdir() if p.name!='holdings.xlsx'),'existing v2 output differs')
             else:os.rename(folder,target)
             outputs[fid]=target
-    return dict(outputs=outputs,errors=batch['errors'])
+    return dict(outputs=outputs,errors={**batch['errors'],**{fid:'行为评估未能生成：'+error for fid,error in batch['behavior_errors'].items()}})
 
 
 def run(ledger, as_of, fid, out, rules=None, *, index_dir=None, points_file=None, bars_dir=None):
@@ -1122,30 +1140,44 @@ def run(ledger, as_of, fid, out, rules=None, *, index_dir=None, points_file=None
     needed={t['symbol'] for t in trade_facts(result) if t['closed'] and t['verified']}
     result['bars']={s:fetch_bars.read_pair(bars_dir,s,as_of) if bars_dir is not None else [] for s in sorted(needed)}
     view=build_view(result,index)
+    import behavior_review as br
+    result['behavior'],error=br.safe_page(result,index,bars_dir)
+    if error:print(result['name']+'（'+fid+'）：行为评估未能生成：'+error)
     od.require(archive_receipts(ledger,as_of)==result['receipts'],'input changed during processing')
     od.require(read_index(index_dir,as_of)['files']==index['files'],'index changed during processing')
-    return write_page(result,view,out,points_file=points_file,validate=lambda:validate_sources(ledger,as_of,result['receipts'],index_dir,index,bars_dir=bars_dir,bars=result['bars']))
+    def validate():
+        validate_sources(ledger,as_of,result['receipts'],index_dir,index,bars_dir=bars_dir,bars=result['bars'])
+        br.validate_cache(result['behavior'],bars_dir)
+    return write_page(result,view,out,points_file=points_file,validate=validate)
 
 
 def write_page(result, view, out, *, points_file=None, validate=None):
     import os
     import zipfile
     import manager_workbook as mw
+    import behavior_review as br
+    behavior=result.get('behavior')
+    if behavior is None:
+        behavior,error=br.safe_page(result,view['index'])
+        if error:print(result['name']+'：行为评估未能生成：'+error)
     out=Path(out);index=view['index'];as_of=result['as_of'];fid=result['product']
     facts=fact_sheet(result,view);points_bytes=Path(points_file).read_bytes() if points_file is not None else None
     validation=None
     if points_bytes is not None:
         validation=validate_points(json.loads(points_bytes),facts)
-    code={name:daily.digest((Path(__file__).parent/name).read_bytes()) for name in (*daily.CODE,'homepage_v2.py','manager_workbook.py','fetch_bars.py')}
+    code={name:daily.digest((Path(__file__).parent/name).read_bytes()) for name in (*daily.CODE,'homepage_v2.py','manager_workbook.py','fetch_bars.py','behavior_review.py')}
     identity=dict(format='homepage-v2-round4',as_of=as_of,product=fid,inputs=result['receipts'],rules=result['rules'],code=code,index=index['files'],bars=result.get('bars',{}),points=daily.digest(points_bytes) if points_bytes is not None else None)
+    identity['behavior']=daily.digest(daily.encoded(behavior))
     identity_bytes=daily.encoded(identity);key=daily.digest(identity_bytes)
     target=out/key
     payload={'MANIFEST.json':identity_bytes,'facts.json':daily.encoded(view),'PAGES.md':render_view(view).encode(),
              'holdings.csv':product_csv(result,view),'AI_FACTS.json':daily.encoded(facts),'AI_FACTS.txt':fact_text(facts).encode()}
+    payload['BEHAVIOR.json']=daily.encoded(behavior)
+    payload['BEHAVIOR.md']=br.markdown(behavior).encode()
     if validation is not None:payload['AI_VALIDATION.json']=daily.encoded(validation)
     with tempfile.TemporaryDirectory() as temp:
         temp=Path(temp);source=temp/'holdings.csv';source.write_bytes(payload['holdings.csv'])
-        mw.write_workbook(source,temp/'holdings.xlsx',**workbook_options(payload['holdings.csv'],index))
+        mw.write_workbook(source,temp/'holdings.xlsx',**workbook_options(payload['holdings.csv'],index,behavior))
         # Package timestamps must not change an otherwise identical v2 artifact.
         buffer=io.BytesIO()
         with zipfile.ZipFile(temp/'holdings.xlsx') as source_zip, zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as dest:
@@ -1156,7 +1188,7 @@ def write_page(result, view, out, *, points_file=None, validate=None):
     od.require(points_bytes is None or Path(points_file).read_bytes()==points_bytes,'points changed during processing')
     if validate:validate()
     if target.exists():
-        od.require({p.name for p in target.iterdir()}==set(payload) and all((target/n).read_bytes()==b for n,b in payload.items()), 'existing v2 output differs')
+        od.require({p.name for p in target.iterdir()}==set(payload) and all((target/n).read_bytes()==b for n,b in payload.items() if n!='holdings.xlsx'), 'existing v2 output differs')
         return target
     out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.homepage-',dir=out) as temp:

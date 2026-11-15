@@ -122,11 +122,15 @@ def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, 
                 import io
                 buffer = io.StringIO(newline=''); csv.writer(buffer, lineterminator='\r\n').writerows(rows)
                 payload[name] = (buffer.getvalue().encode('utf-8'), {'explanation': True})
+        import behavior_review as br
+        behavior_pages={fid:page['behavior'] for fid,page in batch['pages'].items() if not list(csv.reader(page['csv'].decode('utf-8').splitlines()))[3][1].startswith('今日没有持仓表')}
         receipt = {'source': {f.name: sha256(f.read_bytes()).hexdigest() for f in sheets},
                    'v2': {name: sha256(content).hexdigest() for name, (content, _) in payload.items()},
                    'index': batch['index']['files'], 'bars': batch['bars'], 'failures': warnings,
+                   'behavior': {fid: sha256(daily.encoded(page)).hexdigest() for fid,page in behavior_pages.items()},
+                   'behavior_failures': batch['behavior_errors'],
                    'code': {name: sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                            for name in ('homepage_v2.py', 'manager_workbook.py', 'manager.py', 'fetch_index.py', 'fetch_bars.py')}}
+                            for name in ('homepage_v2.py', 'manager_workbook.py', 'manager.py', 'fetch_index.py', 'fetch_bars.py', 'behavior_review.py')}}
         parent = output / '持仓表' / day
         editions = sorted((p for p in parent.glob('第*版') if p.is_dir() and re.fullmatch(r'第[1-9][0-9]*版', p.name)),
                           key=lambda p: int(p.name[1:-1]))
@@ -152,15 +156,22 @@ def generate(source, output, *, index_dir=None, index_fetcher=None, clock=None, 
                     for name, (content, options) in payload.items():
                         source_csv = Path(temp) / name; source_csv.write_bytes(content)
                         write_workbook(source_csv, stage / Path(name).with_suffix('.xlsx'), **options)
+                behavior_folder=stage/'行为评估';behavior_folder.mkdir()
+                for fid,page in behavior_pages.items():
+                    (behavior_folder/(br.storage_name(fid)+'.json')).write_bytes(daily.encoded(page))
+                    (behavior_folder/(br.storage_name(fid)+'.md')).write_text(br.markdown(page),encoding='utf-8')
+                if batch['behavior_errors']:(stage/'BEHAVIOR_FAILURES.json').write_bytes(daily.encoded(batch['behavior_errors']))
                 (stage / marker).write_bytes(daily.encoded(receipt))
                 if warnings: (stage / 'V2_FAILURES.json').write_bytes(daily.encoded(warnings))
                 hp.validate_sources(ledger, day, batch['receipts'], index_dir, batch['index'],
                                     bars_dir=bars_dir, bars=batch['bars'])
+                for page in behavior_pages.values():br.validate_cache(page,bars_dir)
                 stage.rename(target)
             finally:
                 if stage.exists(): shutil.rmtree(stage)
         print(f'MANAGER V2 SUMMARY: products={len(sheets)} v2={len(sheets)-rejected-len(warnings)} fallback={len(warnings)} rejected={rejected}')
         for fid, reason in warnings.items(): print(batch['names'][fid] + '（' + fid + '）：' + reason)
+        for fid,reason in batch['behavior_errors'].items():print(batch['names'][fid]+'（'+fid+'）：行为评估未能生成：'+reason)
         return target, len(sheets), rejected
 
 
@@ -235,6 +246,9 @@ def desktop(config, setup=False):
     if (target / 'V2_FAILURES.json').is_file():
         failures = daily.read_json(target / 'V2_FAILURES.json')
         message += '\n新版首页失败，以下产品已用旧版：\n' + '\n'.join(fid + '：' + reason for fid, reason in failures.items())
+    if (target / 'BEHAVIOR_FAILURES.json').is_file():
+        failures = daily.read_json(target / 'BEHAVIOR_FAILURES.json')
+        message += '\n行为评估未能生成，首页不受影响：\n' + '\n'.join(fid + '：' + reason for fid, reason in failures.items())
     if index_messages:
         message += '\n' + '\n'.join(index_messages)
     if bars_messages:

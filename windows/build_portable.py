@@ -11,7 +11,7 @@ WINDOWS = ROOT / 'windows'
 REPLAY = ROOT / 'examples' / 'oms_replay'
 RUNTIME = 'python-3.13.17-embed-amd64.zip'
 SHA256 = '9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38'
-SOURCES = ('fetch_bars.py', 'fetch_index.py', 'homepage_v2.py', 'manager.py', 'manager_workbook.py', 'daily.py', 'oms_daily.py', 'render.py', 'replay.py')
+SOURCES = ('behavior_review.py', 'fetch_bars.py', 'fetch_index.py', 'homepage_v2.py', 'manager.py', 'manager_workbook.py', 'daily.py', 'oms_daily.py', 'render.py', 'replay.py')
 DEMO = ('各产品持仓.xlsx', '成交查询.xlsx', '资产查询.xlsx', 'SYNTHETIC.txt')
 
 

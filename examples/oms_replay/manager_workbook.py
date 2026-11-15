@@ -220,13 +220,19 @@ EXPLANATIONS = (
     ('缺数据','缺导出或区间端点写未知；有数据但成交未核对写待核实；起点当天不计算的累计写破折号。数据覆盖写明日期、缺口和受影响的行；未提供指数则省略指数项。'),
     ('净值连跌','净值连续下跌至少 3 个估值日时，今日结论写“净值连跌 N 日”（试用条件）。'),
     ('多只','至少 3 只。'),
-    ('回撤提醒后的增减仓','首次提醒以来净买入占比累计达到 +2 个百分点写不降反升，达到 -2 个百分点或更低写已减仓，介于两者之间写未减仓。缺数据不下这项结论。均为试用条件。'),
+    ('回撤提醒后的增减仓','首次提醒日之后累计净买入达到 2 个百分点，并且股票仓位比首次提醒日高出至少 2 个百分点，写不降反升；累计净卖出达到 2 个百分点，并且股票仓位低至少 2 个百分点，写已减仓；其余写未减仓。净买卖达到 2 个百分点而仓位没有同向变化这么多时（常见于申购后补仓、赎回后卖出），同一句写出股票仓位的前后值。缺数据不下这项结论。均为试用条件。'),
     ('临近下一条警示线','持仓仍在提醒段内，距尚未越过的最低浮亏警示线不超过 1 个百分点；恰好在警示线上距离为零。'),
     ('注意风险', '以下三项成立两项及以上时写在今日结论末尾：净值在回撤提醒中（不含回到警示线内的观察期）；浮亏超 10% 的持仓合计占总资产达到 20%；股票仓位达到 80%，且净值在回撤提醒中时没有已减仓的认定。这是风险归纳，不是交易指令。'),
     ('表尾手工金额','黄色金额格可填场外金额和负债，Excel 会重算表尾。首页使用 OMS 收盘导出的数据，不因表尾手填金额重新分析。'),
     ('重跑与新版本','相同导出、首页内容、指数和程序重跑保留已编辑工作簿；任一变化另出一版。旧手改保留在原版本，新版需核对并重新填写。'),
     ('追涨杀跌怎么认','按一只证券、一天、一个方向的成交合计，以成交金额÷成交数量算均价。买入均价较昨收达到 +X%，或高于昨收且高于收盘至少 3%，记追涨；卖出较昨收达到 -X%，或低于昨收且低于收盘至少 3%，记杀跌。其余买入均价高于收盘至少 3%记买入后续跌；卖出均价低于收盘至少 3%记卖出后续涨。沪深普通档 X=5；创业板30、上海68、北交所、港股通 X=7；其他市场不判。缺昨收/收盘、成交未核对，或当日涨跌绝对值超过10.5%/20.5%/30.5%（普通/创业科创/北交所）不判，港股通不限涨跌幅。日线成交日为除权除息日时，昨收不可比，不判；前一交易日除权不影响判定。仍持有的用持仓导出价格；日线只取有已核对成交且收盘已不持有的证券，用不复权的当日与前一交易日收盘。当天沪深15:30、港股通16:30前不取；历史成交日不限。没有接口的市场不取，取数失败不挡生成。汇总按人民币成交额计算；这是单日成交描述，不据此判断习惯。这是按日线涨跌幅做的粗略估计，没有用每笔成交的时间。'),
     ('旧版回退','标题注明新版首页生成失败、本页为旧版时，本产品显示旧版首页。其他产品照常生成新版；数据校验或写盘失败会停止，不借回退掩盖错误。'),
+    ('行为评估怎么读', '第三张表“行为评估”看最近 20 个有账本的交易日，账本第一天没有前一日，不计入。每行分开写当时的操作和之后的结果：两样都成立写“缺陷”，操作成立、已知部分未见不利结果写“特征”，操作不成立写“未见”；没到下结论的条件写“样本不足”，窗口内没有出现这种情形写“未触发”，缺少下结论必需的数据写“待核实”。不凭盈亏推定动机。门槛都是试用值。'),
+    ('回撤提醒后的仓位', '按净值的每一段回撤提醒写一句。不降反升、已减仓、未减仓的认定与首页“回撤提醒后的增减仓”相同。之后升到更高的净值回撤警示线，或回撤比首次提醒日再深至少 2 个百分点，算不利结果。首次提醒日之后满 5 个估值日才下结论。已减仓写“未见”。回撤算不出的日子会注明，已知的最高警示线和最深回撤照样写。'),
+    ('浮亏警示后的处置', '只看浮亏警示线。持仓跌破浮亏警示线满 5 个估值日后计入，每只证券只算一次。同一证券有多段时，依次优先选操作可核实、未减仓、之后升到更高浮亏警示线、加仓的段；仍相同时取最近一段。之后这只证券净买入、并且每份基金对应的持股数量增加超过 1%，算加仓；减仓对称；清仓单列；其余算未动，包括随申购赎回的等比例买卖。未减仓并且之后升到更高浮亏警示线的持仓达到 3 只，写缺陷“浮亏扩大未处置”，其中加仓的达到 3 只再写“越跌越买”；未减仓的达到 3 只而升到更高警示线的不足 3 只，写特征。只列不为零的操作类别；全部持仓的操作都待核实时，结论写“待核实”。'),
+    ('追涨杀跌（窗口）', '把“今日成交”逐日的追涨、杀跌标注在窗口内合计，一只证券、一天、一个方向算一笔。追涨和杀跌占窗口成交额达到 15%、出现在至少 5 个交易日、笔数多于反方向（低吸、高抛），算行为成立；这些成交按当日收盘价计合计为亏，算不利结果。窗口满 20 日、有成交的交易日至少 10 个、未能判定的成交额不超过三分之一才下结论。判为缺陷并且窗口内新跌破浮亏 10% 警示线的持仓达到 5 只时，加写“风险偏好过高，不适应当前市场”。'),
+    ('交易频率', '日均换手超过 10%，并且日均买卖标的超过 20 只，算行为成立。换手＝（买入金额＋卖出金额）÷当日总资产，两项都按窗口内全部交易日平均。窗口累计收益不高于 0 算不利结果，同一行写累计交易费用占资产的比例。窗口满 20 日才下结论。'),
+    ('行为评估不评价的', '决策依据：没有买卖理由的记录，不评价。持仓均衡、仓位管理适应市场：需要 60 个估值日的记录，暂不评价。评价单位是一个产品，不汇总同一位经理的多个产品。'),
 )
 
 
@@ -243,7 +249,50 @@ def explanation_sheet():
     return root
 
 
-def write_workbook(source_csv: Path, target_xlsx: Path, *, nav_start=5, table_rows=(), unsigned_zero=False, state_span=False, nav_count=3, nav_cumulative=False, explanation=False):
+def behavior_sheet(page, style_start):
+    """Four readable columns; all user-facing cells are literal strings."""
+    from behavior_review import HEADER
+    widths = (18, 10, 64, 48)
+    root = ET.Element('worksheet', xmlns=MAIN)
+    cols = ET.SubElement(root, 'cols')
+    for column, width in enumerate(widths, 1):
+        ET.SubElement(cols, 'col', min=str(column), max=str(column), width=str(width), customWidth='1')
+    # A span is a single row merged over all columns. Examples keep the item label.
+    grid = [(True, [page['head'][0]], True)]
+    grid += [(False, [text], True) for text in page['head'][1:]]
+    grid.append((False, [], False))
+    if page['table']:
+        grid.append((True, HEADER, False))
+        grid += [(False, cells, False) for cells in page['table']]
+        grid.append((False, [], False))
+    if page['examples']:
+        grid.append((True, ['例子'], True))
+        grid += [(False, [cells[0], '', cells[2], ''], False) for cells in page['examples']]
+        grid.append((False, [], False))
+    grid += [(False, [text], True) for text in page['tail']]
+    data = ET.SubElement(root, 'sheetData'); merges = []
+    for n, (bold, cells, span) in enumerate(grid, 1):
+        available = [sum(widths)-4] if span else [width-2 for width in widths]
+        height = max([24] + [(1 + text_width(text) // int(available[i])) * 18 + 6 for i, text in enumerate(cells)])
+        dest = ET.SubElement(data, 'row', r=str(n), ht=str(min(height, 409)), customHeight='1')
+        if span:
+            merges.append(f'A{n}:D{n}')
+        for i, text in enumerate(cells):
+            if not text:
+                continue
+            if len(text) > 32767 or re.search(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', text):
+                raise ValueError('unsupported Excel text')
+            c = ET.SubElement(dest, 'c', r=f'{chr(65+i)}{n}', s=str(style_start+int(bold)), t='inlineStr')
+            t = ET.SubElement(ET.SubElement(c, 'is'), 't')
+            t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            t.text = re.sub(r'_(?=x[0-9A-Fa-f]{4}_)', '_x005F_', text)
+    merged = ET.SubElement(root, 'mergeCells', count=str(len(merges)))
+    for ref in merges:
+        ET.SubElement(merged, 'mergeCell', ref=ref)
+    return root
+
+
+def write_workbook(source_csv: Path, target_xlsx: Path, *, nav_start=5, table_rows=(), unsigned_zero=False, state_span=False, nav_count=3, nav_cumulative=False, explanation=False, behavior=None):
     """Write to a new target only. The manager publishes the completed set together."""
     with source_csv.open(encoding='utf-8', newline='') as src:
         sheet = worksheet(list(csv.reader(src, strict=True)), nav_start=nav_start, table_rows=table_rows, state_span=state_span, nav_count=nav_count, nav_cumulative=nav_cumulative)
@@ -267,6 +316,21 @@ def write_workbook(source_csv: Path, target_xlsx: Path, *, nav_start=5, table_ro
         ET.SubElement(book.find('sheets'),'sheet',name='说明',sheetId='2',attrib={'r:id':'rId3'})
         ET.SubElement(links,'Relationship',Id='rId3',Type=OFFICE+'/worksheet',Target='worksheets/sheet2.xml')
         parts['xl/worksheets/sheet2.xml']=explanation_sheet()
+    if behavior is not None:
+        if not explanation:
+            raise ValueError('behavior review requires the reading guide')
+        ET.SubElement(types,'Override',PartName='/xl/worksheets/sheet3.xml',ContentType=f'{TYPES}.worksheet+xml')
+        ET.SubElement(book.find('sheets'),'sheet',name='行为评估',sheetId='3',attrib={'r:id':'rId4'})
+        ET.SubElement(links,'Relationship',Id='rId4',Type=OFFICE+'/worksheet',Target='worksheets/sheet3.xml')
+        styles = parts['xl/styles.xml']
+        xfs = styles.find('cellXfs')
+        style_start = len(xfs)
+        for font, fill in ((0, 0), (1, 2)):
+            xf = ET.SubElement(xfs, 'xf', numFmtId='0', fontId=str(font), fillId=str(fill), borderId='0',
+                               xfId='0', applyFont='1', applyFill='1', applyAlignment='1')
+            ET.SubElement(xf, 'alignment', vertical='top', wrapText='1')
+        xfs.set('count', str(len(xfs)))
+        parts['xl/worksheets/sheet3.xml'] = behavior_sheet(behavior, style_start)
     with target_xlsx.open('xb') as target:
         try:
             with ZipFile(target, 'w', ZIP_DEFLATED) as archive:
